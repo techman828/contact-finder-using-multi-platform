@@ -7,6 +7,8 @@
  *   advance(searchId)           claims the next 'pending' step (row-locked), calls the provider, repeats.
  *                               If a provider answers via webhook the step becomes 'waiting' and advance stops.
  *   POST /api/callbacks/...     handleCallback() stores the result, then after(advance) continues the chain.
+ *   POST /api/webhooks/<id>     handleWebhook(): same, for providers with one dashboard-configured webhook URL;
+ *                               the delivery is matched to the step by the provider's request id (external_id).
  *   GET  /api/searches/:id      reconcile() times out overdue 'waiting' steps / interrupted 'running' steps
  *                               and resumes searches that stalled, so nothing hangs forever.
  */
@@ -14,10 +16,10 @@ import { randomBytes } from 'node:crypto';
 import type { Sql, TransactionSql } from 'postgres';
 import { db, jsonb } from './db';
 import { ProviderError, phoneKey } from './http';
-import { FAILOVER_CODES, keysForUse, recordKeyError, recordKeySuccess } from './keys';
+import { FAILOVER_CODES, getKey, keysForUse, recordKeyError, recordKeySuccess } from './keys';
 import { providerById } from './providers';
 import { getGeneralSettings, getProviderConfigs, resolvePublicUrl } from './settings';
-import type { MergedContact, ProviderResult, ProviderStep, StopRule } from './types';
+import type { CallbackContext, MergedContact, Provider, ProviderResult, ProviderStep, StopRule } from './types';
 
 type Q = Sql | TransactionSql;
 
@@ -231,11 +233,13 @@ async function runStep(sql: Sql, claim: Claim, cfg: { options: Record<string, an
 
       if ('waiting' in r) {
         if (!callbackUrl) throw new Error(`${provider.name} wants a callback but none was offered`);
+        if (provider.sharedWebhook && !r.requestId) throw new Error(`${provider.name} returned no request id to match its webhook to`);
         const timeoutSec = provider.callbackTimeoutSec?.(cfg.options) ?? 120;
         const updated = await sql`
           UPDATE provider_results SET
             status = 'waiting', message = ${withNotes(r.message)}, raw = ${jsonb(r.raw)}::jsonb,
             credits_left = ${r.creditsLeft ?? null}, api_key_id = ${key.id}, api_key_label = ${key.label},
+            external_id = ${r.requestId ?? null},
             deadline_at = now() + make_interval(secs => ${timeoutSec})
           WHERE id = ${claim.stepId} AND status = 'running' RETURNING id`;
         if (!updated.length) {
@@ -270,28 +274,99 @@ async function runStep(sql: Sql, claim: Claim, cfg: { options: Record<string, an
 
 // ------------------------------------------------------------------ callbacks
 
+interface CallbackStep {
+  id: number;
+  search_id: number;
+  status: string;
+  started_at: Date | null;
+  api_key_id: number | null;
+  raw: unknown;
+}
+
 /**
- * Store a provider's webhook payload. Returns:
+ * Store a provider's webhook payload (per-step URL /api/callbacks/<provider>/<token>). Returns:
  *   { ok: false }                     unknown token (respond 404)
  *   { ok: true, resume: searchId }    the chain was waiting on this — call advance(searchId)
- *   { ok: true }                      stored (late result) or already handled
+ *   { ok: true }                      stored (late result), still waiting for a later stage, or already handled
  */
 export async function handleCallback(providerId: string, token: string, body: unknown): Promise<{ ok: boolean; resume?: number }> {
   const provider = providerById[providerId];
   if (!provider?.parseCallback || !/^[0-9a-f]{36}$/.test(token)) return { ok: false };
 
   const sql = await db();
-  const [step] = await sql`
-    SELECT id, search_id, status, started_at, api_key_id FROM provider_results
-    WHERE callback_token = ${token} AND provider = ${providerId}`;
+  const [step] = (await sql`
+    SELECT id, search_id, status, started_at, api_key_id, raw FROM provider_results
+    WHERE callback_token = ${token} AND provider = ${providerId}`) as unknown as CallbackStep[];
   if (!step) return { ok: false };
+  return applyCallback(sql, provider, step, body);
+}
+
+/**
+ * Delivery to a provider's shared webhook URL (/api/webhooks/<provider>). `http` is the status to answer with.
+ * Deliveries that match no step (other event types, test pings, duplicates of an earlier stage) get 200 so the
+ * provider doesn't keep retrying them.
+ */
+export async function handleWebhook(providerId: string, body: unknown): Promise<{ http: number; resume?: number }> {
+  const provider = providerById[providerId];
+  const hook = provider?.sharedWebhook;
+  if (!hook || !provider.parseCallback) return { http: 404 };
+
+  if (hook.verify) {
+    const cfg = (await getProviderConfigs()).find((c) => c.id === providerId);
+    if (!hook.verify(body, cfg?.options ?? {})) {
+      console.warn(`[webhook ${providerId}] rejected a delivery with an invalid signature — check the webhook secret in Settings`);
+      return { http: 401 };
+    }
+  }
+
+  const requestId = hook.requestId(body);
+  if (!requestId) return { http: 200 };
+  const sql = await db();
+  const [step] = (await sql`
+    SELECT id, search_id, status, started_at, api_key_id, raw FROM provider_results
+    WHERE provider = ${providerId} AND external_id = ${requestId}`) as unknown as CallbackStep[];
+  if (!step) return { http: 200 };
+  const r = await applyCallback(sql, provider, step, body);
+  return { http: 200, resume: r.resume };
+}
+
+async function callbackContext(sql: Sql, provider: Provider, step: CallbackStep): Promise<CallbackContext> {
+  const [s] = await sql`SELECT linkedin_url, emails, phones FROM searches WHERE id = ${step.search_id}`;
+  const key = step.api_key_id ? await getKey(step.api_key_id) : null;
+  const cfg = (await getProviderConfigs()).find((c) => c.id === provider.id);
+  return {
+    linkedinUrl: s?.linkedin_url ?? '',
+    apiKey: key?.api_key ?? '',
+    options: cfg?.options ?? {},
+    need: { email: !s?.emails?.length, phone: !s?.phones?.length },
+    previous: step.raw,
+    final: step.status !== 'waiting',
+  };
+}
+
+async function applyCallback(sql: Sql, provider: Provider, step: CallbackStep, body: unknown): Promise<{ ok: boolean; resume?: number }> {
   if (!['running', 'waiting', 'timeout'].includes(step.status)) return { ok: true };
 
   const durationMs = step.started_at ? Date.now() - new Date(step.started_at).getTime() : null;
   let updated;
   try {
-    const r = provider.parseCallback(body);
-    if (step.api_key_id) await recordKeySuccess(step.api_key_id);
+    const ctx = await callbackContext(sql, provider, step);
+    const r = await provider.parseCallback!(body, ctx);
+    if (step.api_key_id) await recordKeySuccess(step.api_key_id, r.creditsLeft);
+
+    if ('waiting' in r) {
+      // Another stage is in flight: keep waiting for it, with a fresh deadline.
+      if (ctx.final) throw new Error(`${provider.name} asked to keep waiting after the wait time was over`);
+      const timeoutSec = provider.callbackTimeoutSec?.(ctx.options) ?? 120;
+      await sql`
+        UPDATE provider_results SET
+          message = ${r.message ?? null}, raw = ${jsonb(r.raw)}::jsonb, external_id = ${r.requestId ?? null},
+          credits_left = COALESCE(${r.creditsLeft ?? null}::int, credits_left),
+          deadline_at = now() + make_interval(secs => ${timeoutSec})
+        WHERE id = ${step.id} AND status = 'waiting'`;
+      return { ok: true };
+    }
+
     const c = resultColumns(r);
     const message = step.status === 'timeout' ? 'Result arrived after the wait time — saved anyway' : c.message;
     updated = await sql`
@@ -305,7 +380,7 @@ export async function handleCallback(providerId: string, token: string, body: un
     }
     updated = await sql`
       UPDATE provider_results SET
-        status = 'error', message = ${errorMessage(err)},
+        status = ${err?.code === 'TIMEOUT' ? 'timeout' : 'error'}, message = ${errorMessage(err)},
         raw = ${jsonb(body)}::jsonb, duration_ms = ${durationMs}
       WHERE id = ${step.id} AND status = ${step.status} RETURNING id`;
   }

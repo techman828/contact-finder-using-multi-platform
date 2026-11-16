@@ -38,6 +38,23 @@ export interface ProviderWaiting {
   message?: string | null;
   creditsLeft?: number | null;
   raw?: unknown;
+  /**
+   * The provider's own id for the pending request. Required for providers with `sharedWebhook`:
+   * deliveries to the shared webhook URL are matched to the step by it.
+   */
+  requestId?: string | null;
+}
+
+/** Passed to parseCallback, so multi-stage providers can send a follow-up request. */
+export interface CallbackContext {
+  linkedinUrl: string;
+  apiKey: string;
+  options: Options;
+  need: { email: boolean; phone: boolean };
+  /** `raw` saved with the waiting step: lets a provider carry data from one stage to the next. */
+  previous: unknown;
+  /** True when the step is no longer waiting (timed out, or still finishing its request): must return a final result. */
+  final: boolean;
 }
 
 export type OptionDef =
@@ -72,7 +89,22 @@ export interface Provider {
   lookup(input: LookupInput): Promise<ProviderResult | ProviderWaiting>;
   /** Max seconds to wait for a callback before moving on. */
   callbackTimeoutSec?(options: Options): number;
-  parseCallback?(body: unknown): ProviderResult;
+  /**
+   * Turn a webhook payload into a result, or return ProviderWaiting to keep waiting for another
+   * delivery (e.g. after sending a follow-up request; the wait time restarts).
+   */
+  parseCallback?(body: unknown, ctx: CallbackContext): ProviderResult | ProviderWaiting | Promise<ProviderResult | ProviderWaiting>;
+  /**
+   * For APIs whose webhook URL is set once in their dashboard instead of passed with each request.
+   * Served at /api/webhooks/<id>. Deliveries are matched to steps by `ProviderWaiting.requestId`.
+   */
+  sharedWebhook?: {
+    requestId(body: unknown): string | null;
+    /** Return false to reject a delivery (HTTP 401). */
+    verify?(body: unknown, options: Options): boolean;
+    /** Setup instructions shown in Settings next to the URL. */
+    help: string;
+  };
   credits?(apiKey: string): Promise<CreditsInfo>;
 }
 
@@ -128,6 +160,8 @@ export interface PublicProvider {
   enabled: boolean;
   keys: PublicKey[];
   canCheckCredits: boolean;
+  /** For providers with a dashboard-configured webhook: the URL to paste there (null without a public URL). */
+  webhook: { url: string | null; help: string } | null;
   optionDefs: OptionDef[];
   options: Options;
 }

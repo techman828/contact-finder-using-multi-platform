@@ -12,7 +12,7 @@ describe.skipIf(!url)('waterfall engine (postgres)', async () => {
   delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
   const { db, closeDb } = await import('@/lib/db');
   const { saveSettings } = await import('@/lib/settings');
-  const { advance, createSearch, handleCallback, reconcile } = await import('@/lib/waterfall');
+  const { advance, createSearch, handleCallback, handleWebhook, reconcile } = await import('@/lib/waterfall');
   const { getSearch, listSearches } = await import('@/lib/searches');
 
   const json = (status: number, body: unknown) =>
@@ -23,14 +23,14 @@ describe.skipIf(!url)('waterfall engine (postgres)', async () => {
 
   let calls: { url: string; body: any; key: string }[] = [];
   type Handler = (body: any, key: string) => Response;
-  function mockFetch(handlers: { signalhire?: Handler; prospeo?: Handler }) {
+  function mockFetch(handlers: { signalhire?: Handler; prospeo?: Handler; welink?: Handler }) {
     calls = [];
     vi.stubGlobal('fetch', async (u: string, init: RequestInit) => {
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       const h0 = (init.headers || {}) as Record<string, string>;
-      const key = h0.apikey || h0['X-KEY'];
+      const key = h0.apikey || h0['X-KEY'] || h0['x-api-key'];
       calls.push({ url: u, body, key });
-      const h = u.includes('signalhire') ? handlers.signalhire : handlers.prospeo;
+      const h = u.includes('signalhire') ? handlers.signalhire : u.includes('we-link') ? handlers.welink : handlers.prospeo;
       if (!h) throw new Error(`unexpected fetch ${u}`);
       return h(body, key);
     });
@@ -344,5 +344,47 @@ describe.skipIf(!url)('waterfall engine (postgres)', async () => {
     expect(keys.map((k) => [k.provider, k.label, k.api_key])).toEqual([['prospeo', 'Key 1', 'legacy-key-123']]);
     const [row] = await (await db())`SELECT value FROM settings WHERE key = 'providers'`;
     expect(JSON.stringify(row.value)).not.toContain('legacy-key-123');
+  });
+
+  it('We-Link: shared webhook, two stages, signature check, then done', async () => {
+    const sql = await db();
+    await configure({ publicUrl: PUBLIC, prospeoEnabled: false });
+    await saveSettings({
+      providers: [
+        { id: 'signalhire', enabled: false },
+        { id: 'prospeo', enabled: false },
+        { id: 'welink', enabled: true, options: { accountId: 'ACC', webhookSecret: 'whsec', timeoutSec: 120 }, keys: [{ label: 'WL', apiKey: 'AK:SEC' }] },
+      ],
+    });
+    mockFetch({ welink: (body) => json(200, { requestId: body.profile_url ? 'req-1' : 'req-2' }) });
+    const { createHmac } = await import('node:crypto');
+    const sign = (data: object) => ({ ...data, hash: createHmac('sha256', 'whsec').update(JSON.stringify(data)).digest('hex') });
+
+    const id = await createSearch('https://www.linkedin.com/in/jane');
+    await advance(id);
+    let s = (await getSearch(id))!;
+    expect(s.providers!.map((p) => [p.provider, p.status])).toEqual([['welink', 'waiting']]);
+
+    const stage1 = { status: 'SUCCESS', request_id: 'req-1', result: { full_name: 'Jane Doe', profile_id: 'ACo1', is_connected: true } };
+    expect(await handleWebhook('welink', { ...stage1, hash: 'bad' })).toEqual({ http: 401 });
+    expect(await handleWebhook('welink', sign({ status: 'SUCCESS', request_id: 'unrelated' }))).toEqual({ http: 200 });
+    expect(await handleWebhook('nope', sign(stage1))).toEqual({ http: 404 });
+
+    // Stage 1 → sends the contact-details request and keeps waiting (no resume yet).
+    expect(await handleWebhook('welink', sign(stage1))).toEqual({ http: 200 });
+    expect(calls.at(-1)!.body).toEqual({ accountId: 'ACC', profile_id: 'ACo1' });
+    const [row] = await sql`SELECT status, external_id FROM provider_results WHERE search_id = ${id} AND provider = 'welink'`;
+    expect(row).toEqual({ status: 'waiting', external_id: 'req-2' });
+    // A duplicate stage-1 delivery no longer matches.
+    expect(await handleWebhook('welink', sign(stage1))).toEqual({ http: 200 });
+    expect(calls).toHaveLength(2);
+
+    const stage2 = { status: 'SUCCESS', requestId: 'req-2', result: { emailAddress: 'jane@gmail.com' } };
+    expect(await handleWebhook('welink', sign(stage2))).toEqual({ http: 200, resume: id });
+    await advance(id);
+    s = (await getSearch(id))!;
+    expect(s.status).toBe('done');
+    expect(s.full_name).toBe('Jane Doe');
+    expect(s.emails.map((e) => [e.value, e.sources])).toEqual([['jane@gmail.com', ['We-Link']]]);
   });
 });

@@ -1,6 +1,6 @@
 # Contact Finder
 
-A Next.js app for Vercel. Paste a LinkedIn profile URL and get emails and phone numbers. Providers are tried in order (a "waterfall"): SignalHire first, then Prospeo, and so on. It stops once it has what you need. Every search is saved to history in Postgres.
+A Next.js app for Vercel. Paste a LinkedIn profile URL and get emails and phone numbers. Providers are tried in order (a "waterfall"): SignalHire first, then Prospeo, then We-Link, and so on. It stops once it has what you need. Every search is saved to history in Postgres.
 
 ## Deploy to Vercel
 
@@ -45,21 +45,30 @@ GET  /api/searches/:id        UI polls every 1.5s; also times out overdue callba
 
 ## Provider notes
 
-| | SignalHire | Prospeo |
-|---|---|---|
-| Endpoint | `POST https://www.signalhire.com/api/v1/candidate/search` | `POST https://api.prospeo.io/enrich-person` |
-| Auth header | `apikey` | `X-KEY` |
-| Mode | Waterfall via callback (public URL), otherwise sync (`withoutWaterfall`) | Synchronous |
-| Cost | 1 credit per matched profile | Email: 1 credit. Mobile: 10 credits. No match: free. Same person again within 90 days: free |
-| Credits check | `GET /api/v1/credits` | `GET /account-information` |
-| Rate limit | 600 profiles/min (trial: 5/min) | Per plan (HTTP 429 → automatic backoff) |
+| | SignalHire | Prospeo | We-Link |
+|---|---|---|---|
+| Endpoint | `POST https://www.signalhire.com/api/v1/candidate/search` | `POST https://api.prospeo.io/enrich-person` | `POST https://api.we-link.ai/api/v1/get_profile_details`, then `…/get_profile_contact_details` |
+| Auth header | `apikey` | `X-KEY` | `x-api-key` + `x-api-secret` (key entered as `API_KEY:API_SECRET[:ACCOUNT_ID]`) |
+| Mode | Waterfall via callback (public URL), otherwise sync (`withoutWaterfall`) | Synchronous | Async, one webhook URL set in the We-Link dashboard (needs a public URL) |
+| Cost | 1 credit per matched profile | Email: 1 credit. Mobile: 10 credits. No match: free. Same person again within 90 days: free | 5 credits per call. Contact info is only requested for 1st-degree connections, so a lookup costs 5–10 |
+| Credits check | `GET /api/v1/credits` | `GET /account-information` | `POST /api/v1/company_usage` |
+| Rate limit | 600 profiles/min (trial: 5/min) | Per plan (HTTP 429 → automatic backoff) | 100 requests/hour per LinkedIn account; results can take minutes |
+
+### We-Link setup
+
+We-Link isn't a contact database. It reads LinkedIn through a LinkedIn account you connect to We-Link, so it only finds the email (and phone, if listed) that the person shows in their LinkedIn *Contact info*. LinkedIn shows that to **1st-degree connections** of the connected account only. Keep it last in the waterfall.
+
+1. In We-Link, connect a LinkedIn account and create an API key (*Settings → Security*).
+2. In this app's *Settings → We-Link*, add the key as `API_KEY:API_SECRET`. Optionally fill in the `accountId`; if it's empty, the first connected account is used.
+3. In We-Link → *Webhooks*, create a webhook with the URL shown under *We-Link* in Settings (`https://<your-app>/api/webhooks/welink`). Enable the triggers **Get Profile Details** and **Get Profile Contact Details**, then copy its *Secret Code* into Settings.
 
 ## Adding another platform
 
 1. Create `lib/providers/<id>.ts` that exports a `Provider` (see `lib/types.ts`; `prospeo.ts` is the simplest template):
    - `id`, `name`, `website`, `docs`, `keyHelp`, `options[]`. These are rendered automatically in Settings.
    - `lookup({ linkedinUrl, apiKey, options, need, callbackUrl })` returns `{ found, person, emails, phones, ... }`, or `{ waiting: true }` if results will arrive by webhook.
-   - Optional: `parseCallback(body)` for webhook APIs, served at `/api/callbacks/<id>/<token>`. Also optional: `credits(apiKey)`.
+   - Optional: `parseCallback(body, ctx)` for webhook APIs, served at `/api/callbacks/<id>/<token>`. It can return `{ waiting: true }` again after sending a follow-up request (multi-stage, see `welink.ts`).
+   - Optional: `sharedWebhook` for APIs that take a single webhook URL in their dashboard instead of a per-request callback. It's served at `/api/webhooks/<id>`, and deliveries are matched by the `requestId` returned from `lookup`. Also optional: `credits(apiKey)`.
 2. Add it to the list in `lib/providers/index.ts`.
 
 Its API keys are managed on the Settings page like the others.

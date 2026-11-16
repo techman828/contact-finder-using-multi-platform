@@ -79,10 +79,11 @@ export async function getProviderConfigs(): Promise<ProviderConfig[]> {
 /** Settings safe to send to the browser (API keys masked). */
 export async function publicSettings(): Promise<PublicSettings> {
   const [general, saved, keys] = await Promise.all([getGeneralSettings(), getSetting<SavedProvider[]>('providers', []), listKeys()]);
+  const publicUrl = resolvePublicUrl(general);
   return {
     general,
     stopRules: STOP_RULES,
-    publicUrl: resolvePublicUrl(general),
+    publicUrl,
     providers: buildConfigs(saved, keys).map(({ config: c, keys: own }) => {
       const p = providerById[c.id];
       return {
@@ -94,6 +95,7 @@ export async function publicSettings(): Promise<PublicSettings> {
         enabled: c.enabled,
         keys: own.map(toPublicKey),
         canCheckCredits: typeof p.credits === 'function',
+        webhook: p.sharedWebhook ? { url: publicUrl ? `${publicUrl}/api/webhooks/${p.id}` : null, help: p.sharedWebhook.help } : null,
         optionDefs: p.options,
         options: c.options,
       };

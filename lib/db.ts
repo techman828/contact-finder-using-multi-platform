@@ -106,6 +106,9 @@ const SCHEMA = `
 
   ALTER TABLE provider_results ADD COLUMN IF NOT EXISTS api_key_id INT REFERENCES api_keys(id) ON DELETE SET NULL;
   ALTER TABLE provider_results ADD COLUMN IF NOT EXISTS api_key_label TEXT;
+  -- Provider's request id, for webhooks sent to one shared URL (We-Link) instead of a per-step callback URL.
+  ALTER TABLE provider_results ADD COLUMN IF NOT EXISTS external_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_pr_external ON provider_results (provider, external_id) WHERE external_id IS NOT NULL;
 
   -- One-time migration: single 'apiKey' stored in settings (v2.0) -> api_keys rows.
   INSERT INTO api_keys (provider, label, api_key, position)

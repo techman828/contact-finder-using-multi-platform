@@ -178,6 +178,18 @@ export default function SettingsView() {
             onChange={(keys, opts) => update(d.id, { keys }, opts?.silent)}
           />
 
+          {d.webhook && (
+            <div className="field">
+              <span className="label">Webhook URL</span>
+              {d.webhook.url ? (
+                <code className="webhook-url">{d.webhook.url}</code>
+              ) : (
+                <span className="hint">{d.name} sends results by webhook. Set a public app URL above first; it can&apos;t reach localhost.</span>
+              )}
+              <span className="help">{d.webhook.help}</span>
+            </div>
+          )}
+
           {d.optionDefs.map((def) => (
             <OptionField
               key={def.key}
