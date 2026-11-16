@@ -1,19 +1,41 @@
 import postgres, { type Sql } from 'postgres';
 
 /**
- * Postgres client. On Vercel use the *pooled* connection string your provider gives you
- * (Neon / Supabase / Vercel Postgres all expose one as DATABASE_URL or POSTGRES_URL).
+ * Postgres client. On Vercel use the *transaction-mode* pooled connection string
+ * (Supabase: port 6543, not the 5432 session pooler; Neon: the "-pooler" host).
+ *
+ * Every serverless instance gets its own pool, and the instances don't share connections.
+ * We keep each instance to one connection and close idle ones quickly so concurrent
+ * instances don't use up the pooler's client limit (EMAXCONNSESSION / "max clients reached").
  */
+const serverless = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
 function createClient(): Sql {
   const url = process.env.DATABASE_URL || process.env.POSTGRES_URL;
   if (!url) throw new Error('DATABASE_URL is not set. Add a Postgres connection string to your environment.');
+  warnIfSessionPooler(url);
   return postgres(url, {
-    max: Number(process.env.DB_POOL_MAX) || 5,
-    idle_timeout: 20,
+    max: Number(process.env.DB_POOL_MAX) || (serverless ? 1 : 5),
+    idle_timeout: serverless ? 5 : 20,
     connect_timeout: 15,
     prepare: false, // required for transaction-mode poolers (PgBouncer, Supabase, Neon pooler)
     onnotice: () => {},
   });
+}
+
+/** Supabase's session-mode pooler (port 5432) gives each client a dedicated slot, which serverless traffic runs out of quickly. */
+function warnIfSessionPooler(url: string) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.endsWith('.pooler.supabase.com') && (u.port || '5432') === '5432') {
+      console.warn(
+        '[db] DATABASE_URL uses the Supabase *session* pooler (port 5432). On serverless this hits ' +
+          '"max clients reached" — switch to the transaction pooler URL (port 6543).',
+      );
+    }
+  } catch {
+    /* not a parseable URL; postgres() will report it */
+  }
 }
 
 // Reuse one client across hot reloads (dev) and invocations of a warm serverless instance.

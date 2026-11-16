@@ -5,7 +5,7 @@ A Next.js app for Vercel. Paste a LinkedIn profile URL and get emails and phone 
 ## Deploy to Vercel
 
 1. Push this repo to GitHub and import it in Vercel.
-2. Add a Postgres database. In the Vercel dashboard, go to **Storage → Create → Neon**, or use Supabase or any other Postgres. This sets `DATABASE_URL` / `POSTGRES_URL`. Use the **pooled** connection string. Tables are created automatically on the first request.
+2. Add a Postgres database. In the Vercel dashboard, go to **Storage → Create → Neon**, or use Supabase or any other Postgres. This sets `DATABASE_URL` / `POSTGRES_URL`. Use the **transaction-mode pooled** connection string (Supabase: the *Transaction pooler* URL on port `6543`, not the session pooler on `5432`, which runs out of clients with `EMAXCONNSESSION`). Tables are created automatically on the first request.
 3. Deploy, open **Settings**, add your API keys (as many per platform as you like), click **Check all**, then **Save settings**.
 
 SignalHire's full waterfall mode works on Vercel without extra setup. The app detects your production domain (`VERCEL_PROJECT_PRODUCTION_URL`) and SignalHire posts results back to `/api/callbacks/signalhire/<token>`. To use a custom domain, set `APP_URL` or fill in *Settings → Public app URL*.
